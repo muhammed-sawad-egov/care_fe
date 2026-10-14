@@ -1,0 +1,121 @@
+name: Deploy Care FE Production (Helm)
+
+# Flow: push to `production` -> build & push image with production REACT_* env
+# -> wait for approval (Environment "production") -> helm upgrade using the
+# chart from the care backend repo, changing only frontend.image.tag.
+
+on:
+  push:
+    branches:
+      - production
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing frontend image tag to deploy (skips build). Leave empty to build HEAD."
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  BACKEND_REPO: care-ecosystem/care
+  RELEASE_NAME: care
+  NAMESPACE: care
+  HELM_VERSION: v3.16.4
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: inputs.image_tag == ''
+    name: Build & push image
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tag
+        id: vars
+        run: echo "tag=production-${GITHUB_SHA::7}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # Vite bakes REACT_* vars in at build time. Store the production values
+      # (REACT_CARE_API_URL=https://careapi..., etc.) as the multi-line repository
+      # variable FE_PRODUCTION_ENV. They ship to the browser, so they are not secrets.
+      - name: Write production env
+        run: printf '%s\n' "${{ vars.FE_PRODUCTION_ENV }}" > .env.production.local
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+            ${{ env.IMAGE }}:production-latest
+          cache-from: type=gha,scope=prod
+          cache-to: type=gha,mode=max,scope=prod
+
+  deploy:
+    needs: build
+    if: always() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.image_tag != ''))
+    name: Deploy to production
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_FE_URL }}
+    steps:
+      - name: Checkout Helm chart from backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BACKEND_REPO }}
+          ref: production
+          sparse-checkout: helm
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          FRONTEND_TAG="${{ inputs.image_tag || needs.build.outputs.tag }}"
+          # Keep whatever backend tag is currently deployed; the care workflow owns it.
+          BACKEND_TAG=$(helm get values "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null \
+            | jq -r '.backend.image.tag // empty')
+          if [ -z "$BACKEND_TAG" ]; then
+            echo "::error::No existing backend release found; deploy the backend first." && exit 1
+          fi
+          echo "frontend=$FRONTEND_TAG" >> "$GITHUB_OUTPUT"
+          echo "backend=$BACKEND_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install "$RELEASE_NAME" helm/care \
+            --namespace "$NAMESPACE" \
+            -f helm/care/values-production.yaml \
+            --set backend.image.tag="${{ steps.tags.outputs.backend }}" \
+            --set frontend.image.tag="${{ steps.tags.outputs.frontend }}" \
+            --atomic --wait --timeout 15m --history-max 10
